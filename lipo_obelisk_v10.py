@@ -171,6 +171,15 @@ class StoreRawSpacingAndTargetd(MapTransform):
             sp = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         d['spacing'] = sp
         d['target_spacing'] = self.target_spacing.copy()
+        # Also store the full 4x4 affine (post-CropFG, pre-in-model-resample).
+        # Used by warp-back so CropFG translation is not lost.
+        if isinstance(img, MetaTensor) and hasattr(img, 'affine'):
+            aff_full = img.affine
+            if torch.is_tensor(aff_full):
+                aff_full = aff_full.detach().cpu().numpy()
+            d['src_affine_crop'] = np.asarray(aff_full, dtype=np.float32).copy()
+        else:
+            d['src_affine_crop'] = np.eye(4, dtype=np.float32)
         return d
 
 
@@ -732,6 +741,62 @@ def warp_back_via_grid_sample(probs, src_spacing, src_shape,
                          padding_mode='border', align_corners=True)
 
 
+def warp_back_via_affine(probs, src_affine, dst_affine, dst_shape,
+                         mode='bilinear'):
+    """Warp `probs` in SRC voxel grid back to DST voxel grid using affines.
+
+    Correctly handles CropFG translation, in-model resample scale, orientation.
+    src_affine : (4,4) maps src voxel (i,j,k,1) → world (x,y,z,1).
+    dst_affine : (4,4) maps dst voxel (i,j,k,1) → world (x,y,z,1)
+                 (dst = raw NIfTI, usually orig_nii.affine).
+    """
+    device = probs.device
+    D, H, W = dst_shape
+
+    if not torch.is_tensor(src_affine):
+        src_affine = torch.tensor(src_affine, device=device, dtype=torch.float32)
+    else:
+        src_affine = src_affine.to(device=device, dtype=torch.float32)
+    if not torch.is_tensor(dst_affine):
+        dst_affine = torch.tensor(dst_affine, device=device, dtype=torch.float32)
+    else:
+        dst_affine = dst_affine.to(device=device, dtype=torch.float32)
+
+    ii = torch.arange(D, device=device, dtype=torch.float32)
+    jj = torch.arange(H, device=device, dtype=torch.float32)
+    kk = torch.arange(W, device=device, dtype=torch.float32)
+    gi, gj, gk = torch.meshgrid(ii, jj, kk, indexing='ij')
+    ones = torch.ones_like(gi)
+    coords = torch.stack([gi, gj, gk, ones], dim=-1)
+
+    world = torch.einsum('ab,dhwb->dhwa', dst_affine, coords)
+    src_affine_inv = torch.linalg.inv(src_affine)
+    src_vox = torch.einsum('ab,dhwb->dhwa', src_affine_inv, world)[..., :3]
+
+    D_s, H_s, W_s = probs.shape[2], probs.shape[3], probs.shape[4]
+    n_i = 2.0 * src_vox[..., 0] / max(D_s - 1, 1) - 1.0
+    n_j = 2.0 * src_vox[..., 1] / max(H_s - 1, 1) - 1.0
+    n_k = 2.0 * src_vox[..., 2] / max(W_s - 1, 1) - 1.0
+    grid = torch.stack([n_k, n_j, n_i], dim=-1).unsqueeze(0)
+    return F.grid_sample(probs, grid, mode=mode,
+                         padding_mode='border', align_corners=True)
+
+
+def build_src_affine_after_resample(src_affine_crop, s_orig, s_tgt):
+    """Effective affine of the in-model-resampled volume.
+
+    The resampler (grid_sample, align_corners=True) keeps voxel 0 aligned with
+    voxel 0 of the cropped input. Only voxel scale changes from s_orig to s_tgt.
+    So A_res = A_crop @ diag(s_tgt / s_orig, 1).
+    """
+    src_affine_crop = np.asarray(src_affine_crop, dtype=np.float64)
+    s_orig = np.asarray(s_orig, dtype=np.float64)
+    s_tgt = np.asarray(s_tgt, dtype=np.float64)
+    ratio = s_tgt / np.maximum(s_orig, 1e-9)
+    scale = np.diag(np.concatenate([ratio, [1.0]]))
+    return (src_affine_crop @ scale).astype(np.float32)
+
+
 def compute_hd95(pred_bin, label_bin, spacing):
     if pred_bin.sum() == 0 or label_bin.sum() == 0:
         return float('inf')
@@ -933,9 +998,16 @@ def _eval_val_dice_orig(model, val_loader, device, patch_size, total_stride,
             orig_shape = tuple(orig_label.shape[2:])
 
             probs = torch.softmax(val_logits, dim=1)
-            probs_orig = model.resampler.warp_back_to_original(
-                probs, v_sp_orig, orig_shape, mode='bilinear',
-                s_ref_override=s_ref_override)
+            src_affine_crop = vd['src_affine_crop'][0].cpu().numpy() \
+                if torch.is_tensor(vd['src_affine_crop']) \
+                else np.asarray(vd['src_affine_crop'][0])
+            s_tgt = model.resampler.get_spacing(s_ref_override).detach().cpu().numpy()
+            src_affine_res = build_src_affine_after_resample(
+                src_affine_crop, v_sp_orig.cpu().numpy(), s_tgt)
+            probs_orig = warp_back_via_affine(
+                probs, src_affine=src_affine_res,
+                dst_affine=orig_nii.affine, dst_shape=orig_shape,
+                mode='bilinear')
             pred_orig = probs_orig.argmax(dim=1, keepdim=True)
             pred_orig = post_process(pred_orig)
             dice_list.append(_dice_from_labels(pred_orig, orig_label.long()).item())
@@ -1361,9 +1433,16 @@ def main():
                         orig_shape = tuple(orig_label.shape[2:])
 
                         probs = torch.softmax(val_logits, dim=1)
-                        probs_orig = model.resampler.warp_back_to_original(
-                            probs, v_sp_orig, orig_shape, mode='bilinear',
-                            s_ref_override=s_ref_override)
+                        src_affine_crop = vd['src_affine_crop'][0].cpu().numpy() \
+                            if torch.is_tensor(vd['src_affine_crop']) \
+                            else np.asarray(vd['src_affine_crop'][0])
+                        s_tgt = model.resampler.get_spacing(s_ref_override).detach().cpu().numpy()
+                        src_affine_res = build_src_affine_after_resample(
+                            src_affine_crop, v_sp_orig.cpu().numpy(), s_tgt)
+                        probs_orig = warp_back_via_affine(
+                            probs, src_affine=src_affine_res,
+                            dst_affine=orig_nii.affine, dst_shape=orig_shape,
+                            mode='bilinear')
                         pred_orig = probs_orig.argmax(dim=1, keepdim=True)
                         pred_orig = post_process(pred_orig)
                         d_orig = _dice_from_labels(pred_orig, orig_label.long()).item()
@@ -1493,9 +1572,16 @@ def main():
                 orig_shape = tuple(orig_label.shape[2:])
 
                 probs = torch.softmax(val_logits, dim=1)
-                probs_orig = model.resampler.warp_back_to_original(
-                    probs, v_sp_orig, orig_shape, mode='bilinear',
-                    s_ref_override=s_ref_override)
+                src_affine_crop = vd['src_affine_crop'][0].cpu().numpy() \
+                    if torch.is_tensor(vd['src_affine_crop']) \
+                    else np.asarray(vd['src_affine_crop'][0])
+                s_tgt = model.resampler.get_spacing(s_ref_override).detach().cpu().numpy()
+                src_affine_res = build_src_affine_after_resample(
+                    src_affine_crop, v_sp_orig.cpu().numpy(), s_tgt)
+                probs_orig = warp_back_via_affine(
+                    probs, src_affine=src_affine_res,
+                    dst_affine=orig_nii.affine, dst_shape=orig_shape,
+                    mode='bilinear')
                 pred_orig = probs_orig.argmax(dim=1, keepdim=True)
                 pred_orig = post_process(pred_orig)
 

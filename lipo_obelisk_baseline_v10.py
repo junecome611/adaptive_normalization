@@ -140,6 +140,31 @@ class ZScoreNormalizeForegroundd(MapTransform):
         return m, s
 
 
+class StoreAffined(MapTransform):
+    """Store the MetaTensor 4x4 affine as a plain numpy array in data dict.
+
+    Place AFTER all geometric transforms (CropFG, Spacingd) so the captured
+    affine maps src_voxel → world and already includes all crop/resample
+    translations+scales. Needed for correct warp-back to raw NIfTI space.
+    """
+
+    def __init__(self, keys, key_out='src_affine', allow_missing_keys=False):
+        super().__init__(keys, allow_missing_keys)
+        self.key_out = key_out
+
+    def __call__(self, data):
+        d = dict(data)
+        img = d[self.keys[0]]
+        if isinstance(img, MetaTensor) and hasattr(img, 'affine'):
+            aff = img.affine
+            if torch.is_tensor(aff):
+                aff = aff.detach().cpu().numpy()
+            d[self.key_out] = np.asarray(aff, dtype=np.float32).copy()
+        else:
+            d[self.key_out] = np.eye(4, dtype=np.float32)
+        return d
+
+
 class StoreSpacingd(MapTransform):
     """Read voxel spacing from MetaTensor affine after Spacingd has been applied.
 
@@ -591,6 +616,55 @@ def warp_back_via_grid_sample(probs, src_spacing, src_shape,
                          padding_mode='border', align_corners=True)
 
 
+def warp_back_via_affine(probs, src_affine, dst_affine, dst_shape,
+                         mode='bilinear'):
+    """Warp `probs` in SRC voxel grid back to DST voxel grid using affines.
+
+    src_affine : (4,4) maps src voxel (i,j,k,1) → world (x,y,z,1)
+    dst_affine : (4,4) maps dst voxel (i,j,k,1) → world (x,y,z,1)
+                 (dst = raw NIfTI, usually orig_nii.affine)
+    dst_shape  : (D, H, W) of the target volume in dst voxels.
+
+    Correctly handles: CropFG translation, Spacingd scale, orientation
+    (anything baked into either affine). Replaces the old
+    `warp_back_via_grid_sample` that assumed src voxel 0 == dst voxel 0.
+    """
+    device = probs.device
+    D, H, W = dst_shape
+
+    if not torch.is_tensor(src_affine):
+        src_affine = torch.tensor(src_affine, device=device, dtype=torch.float32)
+    else:
+        src_affine = src_affine.to(device=device, dtype=torch.float32)
+    if not torch.is_tensor(dst_affine):
+        dst_affine = torch.tensor(dst_affine, device=device, dtype=torch.float32)
+    else:
+        dst_affine = dst_affine.to(device=device, dtype=torch.float32)
+
+    ii = torch.arange(D, device=device, dtype=torch.float32)
+    jj = torch.arange(H, device=device, dtype=torch.float32)
+    kk = torch.arange(W, device=device, dtype=torch.float32)
+    gi, gj, gk = torch.meshgrid(ii, jj, kk, indexing='ij')
+    ones = torch.ones_like(gi)
+    # dst voxel coords (i, j, k, 1) as [D,H,W,4]
+    coords = torch.stack([gi, gj, gk, ones], dim=-1)
+
+    # world = dst_affine @ coords^T
+    world = torch.einsum('ab,dhwb->dhwa', dst_affine, coords)
+    # src_vox = inv(src_affine) @ world
+    src_affine_inv = torch.linalg.inv(src_affine)
+    src_vox = torch.einsum('ab,dhwb->dhwa', src_affine_inv, world)[..., :3]
+
+    D_s, H_s, W_s = probs.shape[2], probs.shape[3], probs.shape[4]
+    n_i = 2.0 * src_vox[..., 0] / max(D_s - 1, 1) - 1.0
+    n_j = 2.0 * src_vox[..., 1] / max(H_s - 1, 1) - 1.0
+    n_k = 2.0 * src_vox[..., 2] / max(W_s - 1, 1) - 1.0
+    # grid_sample expects (x, y, z) = (W_axis, H_axis, D_axis)
+    grid = torch.stack([n_k, n_j, n_i], dim=-1).unsqueeze(0)
+    return F.grid_sample(probs, grid, mode=mode,
+                         padding_mode='border', align_corners=True)
+
+
 def compute_hd95(pred_bin, label_bin, spacing):
     if pred_bin.sum() == 0 or label_bin.sum() == 0:
         return float('inf')
@@ -751,6 +825,10 @@ def parse_args():
     p.add_argument('--early_stop_patience', type=int, default=100)
     p.add_argument('--num_patches', type=int, default=4)
     p.add_argument('--pos_ratio', type=float, default=0.5)
+    p.add_argument('--variant', type=str, default='v10_match',
+                   choices=['v3_match', 'v10_match'],
+                   help='v3_match: Spacingd→CropFG→ZScore(otsu). '
+                        'v10_match: CropFG→ZScore(gt_zero)→Spacingd.')
     return p.parse_args()
 
 
@@ -791,29 +869,44 @@ def main():
     anisotropy_axis = fp['anisotropy_axis']
 
     # ── CPU transforms ────────────────────────────────────────────────────────
-    # Pipeline: Load → CropFG(Otsu) → ZScore(raw, gt_zero) → Spacingd(cubic,nearest)
-    # Note: ZScore on raw image, then Spacingd. Same for both train and val.
+    # variant v3_match  : Spacingd → CropFG(Otsu) → ZScore(fg=otsu, on resampled)
+    # variant v10_match : CropFG(Otsu) → ZScore(fg=gt_zero, on raw) → Spacingd
+    # StoreAffined captures final affine (post-everything) for warp-back.
+    if args.variant == 'v3_match':
+        print(f"[INFO] Pipeline variant: v3_match "
+              f"(Spacingd → CropFG → ZScore(fg=otsu))")
+        core_xforms = [
+            Spacingd(keys=['image', 'label'], pixdim=target_pixdim,
+                     mode=(3, 'nearest')),
+            CropForegroundd(keys=['image', 'label'], source_key='image',
+                            select_fn=otsu_select_fn, margin=(10, 10, 3)),
+            ZScoreNormalizeForegroundd(keys=['image'], fg_mode='otsu'),
+        ]
+    else:
+        print(f"[INFO] Pipeline variant: v10_match "
+              f"(CropFG → ZScore(fg=gt_zero) → Spacingd)")
+        core_xforms = [
+            CropForegroundd(keys=['image', 'label'], source_key='image',
+                            select_fn=otsu_select_fn, margin=(10, 10, 3)),
+            ZScoreNormalizeForegroundd(keys=['image'], fg_mode='gt_zero'),
+            Spacingd(keys=['image', 'label'], pixdim=target_pixdim,
+                     mode=(3, 'nearest')),
+        ]
+
     train_transforms = Compose([
         LoadImaged(keys=['image', 'label']),
         EnsureChannelFirstd(keys=['image', 'label']),
-        CropForegroundd(keys=['image', 'label'], source_key='image',
-                        select_fn=otsu_select_fn, margin=(10, 10, 3)),
-        ZScoreNormalizeForegroundd(keys=['image'], fg_mode='gt_zero'),
-        Spacingd(keys=['image', 'label'], pixdim=target_pixdim,
-                 mode=(3, 'nearest')),
+        *core_xforms,
+        StoreAffined(keys=['image'], key_out='src_affine'),
         EnsureTyped(keys=['image'], dtype=np.float32),
         EnsureTyped(keys=['label'], dtype=np.uint8),
         ToTensord(keys=['image', 'label']),
     ])
-
     val_transforms = Compose([
         LoadImaged(keys=['image', 'label']),
         EnsureChannelFirstd(keys=['image', 'label']),
-        CropForegroundd(keys=['image', 'label'], source_key='image',
-                        select_fn=otsu_select_fn, margin=(10, 10, 3)),
-        ZScoreNormalizeForegroundd(keys=['image'], fg_mode='gt_zero'),
-        Spacingd(keys=['image', 'label'], pixdim=target_pixdim,
-                 mode=(3, 'nearest')),
+        *core_xforms,
+        StoreAffined(keys=['image'], key_out='src_affine'),
         EnsureTyped(keys=['image'], dtype=np.float32),
         EnsureTyped(keys=['label'], dtype=np.uint8),
         ToTensord(keys=['image', 'label']),
@@ -1033,12 +1126,13 @@ def main():
                         orig_shape = tuple(orig_label.shape[2:])
 
                         probs = torch.softmax(val_logits, dim=1)
-                        # vi_p is at target_pixdim; warp from target_pixdim back to orig_spacing
-                        probs_orig = warp_back_via_grid_sample(
+                        src_affine = vd['src_affine'][0].cpu().numpy() \
+                            if torch.is_tensor(vd['src_affine']) \
+                            else np.asarray(vd['src_affine'][0])
+                        probs_orig = warp_back_via_affine(
                             probs,
-                            src_spacing=np.array(target_pixdim),
-                            src_shape=tuple(probs.shape[2:]),
-                            dst_spacing=orig_spacing,
+                            src_affine=src_affine,
+                            dst_affine=orig_nii.affine,
                             dst_shape=orig_shape,
                             mode='bilinear')
                         pred_orig = probs_orig.argmax(dim=1, keepdim=True)
@@ -1141,9 +1235,13 @@ def main():
                 orig_shape = tuple(orig_label.shape[2:])
 
                 probs = torch.softmax(val_logits, dim=1)
-                probs_orig = warp_back_via_grid_sample(
-                    probs, np.array(target_pixdim), tuple(probs.shape[2:]),
-                    orig_spacing, orig_shape, mode='bilinear')
+                src_affine = vd['src_affine'][0].cpu().numpy() \
+                    if torch.is_tensor(vd['src_affine']) \
+                    else np.asarray(vd['src_affine'][0])
+                probs_orig = warp_back_via_affine(
+                    probs, src_affine=src_affine,
+                    dst_affine=orig_nii.affine, dst_shape=orig_shape,
+                    mode='bilinear')
                 pred_orig = probs_orig.argmax(dim=1, keepdim=True)
                 pred_orig = post_process(pred_orig)
 
